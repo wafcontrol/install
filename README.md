@@ -9,7 +9,7 @@ It simplifies installation, configuration, and operation of CRS and ModSecurity,
 ## Easy Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wafcontrol/install/refs/heads/main/install.sh -o install.sh
+curl -fsSL https://wafcontrol.org/download/install.sh -o install.sh
 ```
 
 ```bash
