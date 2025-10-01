@@ -21,7 +21,7 @@ trap 'err "Failed on line $LINENO"' ERR
 export DEBIAN_FRONTEND=noninteractive
 
 # ===== Config =====
-MODULE_BASE="${MODULE_BASE:-https://github.com/wafcontrol/install/tree/main/modules}"
+MODULE_BASE="${MODULE_BASE:-https://raw.githubusercontent.com/wafcontrol/install/refs/heads/main/modules/}"
 STATE_DIR="${STATE_DIR:-/var/lib/wafcontrol-installer}"
 STATE_FILE="${STATE_FILE:-$STATE_DIR/state.env}"
 
