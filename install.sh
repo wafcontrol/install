@@ -53,6 +53,7 @@ fetch_and_run() {
 
 detect_os() { . /etc/os-release 2>/dev/null || true; echo "${ID:-}"; }
 detect_codename() { . /etc/os-release 2>/dev/null || true; echo "${VERSION_CODENAME:-}"; }
+detect_ubuntu() { [ "$(detect_os)" = "ubuntu" ]; }
 
 ensure_debian_sources() {
   local codename; codename="$(detect_codename)"
@@ -88,8 +89,6 @@ EOF
     *) : ;;
   esac
 }
-
-detect_ubuntu() { [ "$(detect_os)" = "ubuntu" ]; }
 
 ensure_python_ubuntu() {
   . /etc/os-release
@@ -143,10 +142,55 @@ DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-5432}"
 PG_VERSION="${PG_VERSION:-}"
 
-# Basic Auth defaults to avoid unbound with `set -u`
 BASIC_AUTH_ENABLE="${BASIC_AUTH_ENABLE:-0}"
 BASIC_AUTH_USER="${BASIC_AUTH_USER:-}"
 BASIC_AUTH_PASS="${BASIC_AUTH_PASS:-}"
+
+# ===== Helpers (new) =====
+detect_webserver_choice() {
+  local have_nginx=0 have_apache=0
+  command -v nginx >/dev/null 2>&1 && have_nginx=1
+  command -v apache2ctl >/dev/null 2>&1 && have_apache=1
+
+  if [ $have_nginx -eq 1 ] && [ $have_apache -eq 0 ]; then
+    echo "nginx"
+  elif [ $have_nginx -eq 0 ] && [ $have_apache -eq 1 ]; then
+    echo "apache"
+  else
+    echo ""  # ambiguous -> ask user
+  fi
+}
+
+find_postgresql_conf() {
+  local v="${1:-}"
+  # Try Debian/Ubuntu layout first
+  if [ -n "$v" ]; then
+    local p
+    p=$(find "/etc/postgresql/${v}" -maxdepth 3 -name postgresql.conf 2>/dev/null | head -n1 || true)
+    [ -n "$p" ] && { echo "$p"; return; }
+  fi
+  # Fallback: any postgresql.conf under /etc/postgresql
+  local any
+  any=$(find /etc/postgresql -maxdepth 4 -name postgresql.conf 2>/dev/null | head -n1 || true)
+  [ -n "$any" ] && { echo "$any"; return; }
+  echo ""
+}
+
+extract_port_from_conf() {
+  local conf="$1"
+  [ -r "$conf" ] || { echo ""; return; }
+  # Pick the last uncommented 'port = NNNN' assignment
+  awk '
+    /^[[:space:]]*#/ {next}
+    /^[[:space:]]*port[[:space:]]*=/ {
+      gsub(/[[:space:]]+/,"")
+      sub(/port=/,"")
+      # remove trailing comments if any
+      sub(/#.*/,"")
+      print; found=$0
+    }
+  END{ if (found) print found }' "$conf" | tail -n1 | tr -d '[:space:]'
+}
 
 # ===== Intro =====
 banner "WafControl Installer (Debian/Ubuntu)" "=" 72
@@ -161,14 +205,20 @@ This guided installer will set up:
 TXT
 line "-" 72
 
-# ===== Prompts =====
+# ===== Web server selection (auto if unambiguous) =====
 echo
 section "Web server selection"
-echo "Type 'nginx' to build ModSecurity v3 for your Nginx and apply latest CRS."
-echo "Type 'apache' to enable ModSecurity2 and apply latest CRS."
-read -rp "Choose [nginx/apache] (default: nginx): " SERVER
-SERVER="${SERVER:-nginx}"
-[[ "$SERVER" =~ ^(nginx|apache)$ ]] || { err "Invalid server: $SERVER"; }
+auto_srv="$(detect_webserver_choice || true)"
+if [ -n "$auto_srv" ]; then
+  SERVER="$auto_srv"
+  say "Detected web server: $SERVER (auto-selected)."
+else
+  echo "Type 'nginx' to build ModSecurity v3 for your Nginx and apply latest CRS."
+  echo "Type 'apache' to enable ModSecurity2 and apply latest CRS."
+  read -rp "Choose [nginx/apache] (default: nginx): " SERVER
+  SERVER="${SERVER:-nginx}"
+  [[ "$SERVER" =~ ^(nginx|apache)$ ]] || { err "Invalid server: $SERVER"; }
+fi
 
 echo
 section "Run mode selection"
@@ -203,6 +253,20 @@ if command -v psql >/dev/null 2>&1; then
   INSTALLED_MAJOR="$(psql -V | awk '{print $3}' | cut -d. -f1)"
   PG_VERSION="${INSTALLED_MAJOR}"
   say "PostgreSQL detected: version ${PG_VERSION} (will be reused)."
+
+  # NEW: detect actual port from postgresql.conf
+  conf_path="$(find_postgresql_conf "$PG_VERSION")"
+  if [ -n "$conf_path" ]; then
+    det_port="$(extract_port_from_conf "$conf_path")"
+    if [[ -n "$det_port" && "$det_port" =~ ^[0-9]+$ ]]; then
+      DB_PORT="$det_port"
+      say "Detected PostgreSQL port from config: ${DB_PORT}"
+    else
+      say "Could not detect custom port from config. Using default ${DB_PORT}."
+    fi
+  else
+    say "postgresql.conf not found for auto-port detection. Using default ${DB_PORT}."
+  fi
 else
   echo "PostgreSQL not detected. Provide the major version to install (e.g. 17)."
   read -rp "PostgreSQL major version to install: " PG_VERSION
@@ -252,7 +316,7 @@ else
   echo "• Mode:         ip"
   echo "• HTTP Port:    $HTTP_PORT"
 fi
-echo "• PostgreSQL:   $PG_VERSION  (db=$DB_NAME, user=$DB_USER)"
+echo "• PostgreSQL:   $PG_VERSION  (db=$DB_NAME, user=$DB_USER, port=$DB_PORT)"
 echo "• App Path:     $APP_DIR"
 echo "• Basic Auth:   $([[ $BASIC_AUTH_ENABLE -eq 1 ]] && echo "enabled (user=$BASIC_AUTH_USER)" || echo "disabled")"
 read -rp "Proceed with installation? [y/N]: " PROCEED
@@ -382,8 +446,8 @@ if [[ "$MODE" == "domain" && -n "${DOMAIN:-}" ]]; then
 fi
 
 banner "Verifying database connectivity" "=" 72
-if ! PGPASSWORD="${DB_PASS}" psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -c 'select 1;' >/dev/null 2>&1; then
-  err "Database auth failed. Check DB_USER/DB_PASS/pg_hba.conf."
+if ! PGPASSWORD="${DB_PASS}" psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" -c 'select 1;' >/dev/null 2>&1; then
+  err "Database auth failed. Check DB_USER/DB_PASS/DB_PORT/pg_hba.conf."
 fi
 
 banner "Applying migrations and collecting static files" "=" 72

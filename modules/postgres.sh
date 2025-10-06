@@ -22,8 +22,11 @@ export DEBIAN_FRONTEND=noninteractive
 STATE_DIR="${STATE_DIR:-/var/lib/wafcontrol-installer}"
 STATE_FILE="${STATE_FILE:-$STATE_DIR/state.env}"
 mkdir -p "$STATE_DIR"; touch "$STATE_FILE"
+state_append_array() { printf '%s+=(%q)\n' "$1" "$2" >> "$STATE_FILE"; }
 state_put_map()  { printf '%s[%q]=%q\n' "$1" "$2" "$3" >> "$STATE_FILE"; }
 state_put_flag() { printf 'FLAGS[%q]=%q\n' "$1" "$2" >> "$STATE_FILE"; }
+# shellcheck disable=SC1090
+source "$STATE_FILE" 2>/dev/null || true
 
 # ===== INPUTS =====
 DB_NAME="${DB_NAME:?}"
@@ -54,6 +57,25 @@ find_pg_hba() {
   [[ -z "$p" ]] && p=$(find /etc/postgresql -maxdepth 4 -name pg_hba.conf 2>/dev/null | head -n1)
   echo "$p"
 }
+find_postgresql_conf() {
+  local v="$1" p
+  p=$(find "/etc/postgresql/${v}" -maxdepth 3 -name postgresql.conf 2>/dev/null | head -n1)
+  [[ -z "$p" ]] && p=$(find /etc/postgresql -maxdepth 4 -name postgresql.conf 2>/dev/null | head -n1)
+  echo "$p"
+}
+extract_port_from_conf() {
+  local conf="$1"
+  [ -r "$conf" ] || { echo ""; return; }
+  awk '
+    /^[[:space:]]*#/ {next}
+    /^[[:space:]]*port[[:space:]]*=/ {
+      gsub(/[[:space:]]+/,"")
+      sub(/port=/,"")
+      sub(/#.*/,"")
+      print; found=$0
+    }
+  END{ if (found) print found }' "$conf" | tail -n1 | tr -d '[:space:]'
+}
 
 line "-" 72
 if command -v psql >/dev/null 2>&1; then
@@ -67,19 +89,37 @@ else
   ensure_postgres "$PG_VERSION"
 fi
 
+# NEW: auto-detect DB_PORT from postgresql.conf if present
+PG_CONF="$(find_postgresql_conf "$PG_VERSION")"
+if [ -n "$PG_CONF" ]; then
+  det_port="$(extract_port_from_conf "$PG_CONF")"
+  if [[ -n "$det_port" && "$det_port" =~ ^[0-9]+$ ]]; then
+    DB_PORT="$det_port"
+    say "Detected PostgreSQL port: ${DB_PORT}"
+  fi
+fi
+
 PG_HBA="$(find_pg_hba "$PG_VERSION")"
 [[ -n "$PG_HBA" ]] || { err "pg_hba.conf not found for major ${PG_VERSION}"; }
 
+# Try to connect as postgres without password. If it fails, temporarily enforce peer for local postgres user.
 NEED_RESTORE=0
 if ! sudo -u postgres psql -tAc "SELECT 1" >/dev/null 2>&1; then
   bak="${PG_HBA}.bak.$(date +%s)"
   cp -a "$PG_HBA" "$bak"
   state_put_map BACKUPS "$PG_HBA" "$bak"
   NEED_RESTORE=1
-  sed -i -E 's/^(local[[:space:]]+all[[:space:]]+all[[:space:]]+).*/\1trust/' "$PG_HBA"
-  sed -i -E 's/^(local[[:space:]]+all[[:space:]]+postgres[[:space:]]+).*/\1trust/' "$PG_HBA" || true
+
+  # Insert a top rule for local postgres peer (non-destructive: we prepend; later we fully restore)
+  tmp="$(mktemp)"
+  {
+    echo "local   all             postgres                                peer"
+    cat "$PG_HBA"
+  } > "$tmp"
+  mv "$tmp" "$PG_HBA"
+
   systemctl reload postgresql || systemctl restart postgresql
-  sudo -u postgres psql -tAc "SELECT 1" >/dev/null 2>&1 || { err "psql inaccessible even after temporary trust"; }
+  sudo -u postgres psql -tAc "SELECT 1" >/dev/null 2>&1 || { err "psql inaccessible even after temporary peer rule"; }
 fi
 line "-" 72
 
@@ -88,7 +128,7 @@ sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='${DB_USER}') THEN
-    EXECUTE format('CREATE USER %I WITH PASSWORD %L SUPERUSER', '${DB_USER}', '${DB_PASS}');
+    EXECUTE format('CREATE USER %I WITH PASSWORD %L', '${DB_USER}', '${DB_PASS}');
   END IF;
 END
 \$\$;
@@ -101,11 +141,14 @@ EXISTS_DB=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname=
 [[ "$EXISTS_DB" == "1" ]] || sudo -u postgres createdb -O "${DB_USER}" "${DB_NAME}"
 sudo -u postgres psql -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};"
 
+# Restore pg_hba.conf exactly if we modified it
 if [[ $NEED_RESTORE -eq 1 ]]; then
   cp -f "${PG_HBA}.bak."* "$PG_HBA" 2>/dev/null || true
-  sed -i -E 's/( scram-sha-256| trust)([[:space:]]|$)/ md5\2/g' "$PG_HBA" || true
   systemctl reload postgresql || systemctl restart postgresql
 fi
 
+# Persist detected port in state (so install.sh writes correct .env)
 state_put_flag "pg_major" "$PG_VERSION"
-banner "PostgreSQL ${PG_VERSION} ready (db=${DB_NAME}, user=${DB_USER})" "=" 72
+state_put_flag "pg_port" "$DB_PORT"
+
+banner "PostgreSQL ${PG_VERSION} ready (db=${DB_NAME}, user=${DB_USER}, port=${DB_PORT})" "=" 72
