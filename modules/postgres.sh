@@ -44,22 +44,55 @@ pgdg_add_repo() {
 }
 ensure_postgres() {
   local v="$1"
-  apt install -y "postgresql-${v}" "postgresql-client-${v}" libpq-dev "postgresql-server-dev-${v}"
+  apt install -y "postgresql-${v}" "postgresql-client-${v}" libpq-dev "postgresql-server-dev-${v}" postgresql-common
   systemctl enable --now postgresql
   for _ in {1..30}; do pg_isready >/dev/null 2>&1 && break; sleep 1; done
 }
-find_pg_hba() {
+
+# ---- Active cluster discovery ----
+get_active_datadir() {
+  if command -v pg_lsclusters >/dev/null 2>&1; then
+    # pick the first online cluster
+    local line; line="$(pg_lsclusters 2>/dev/null | awk 'NR>1 && $6=="online"{print; exit}')" || true
+    if [ -n "${line:-}" ]; then
+      # columns: Ver Cluster Port Status Owner Data directory        Log file
+      echo "$line" | awk '{print $(NF-1)}' | tr -d '\n'
+      return 0
+    fi
+  fi
+  # fallback via the postmaster process -D
+  local pid; pid="$(pgrep -u postgres -f "postgres .* -D " | head -n1 || true)"
+  if [ -n "${pid:-}" ]; then
+    tr '\0' ' ' < "/proc/$pid/cmdline" | sed -E 's/.* -D ([^ ]+).*/\1/' | tr -d '\n'
+    return 0
+  fi
+  echo ""
+}
+
+find_pg_hba_active() {
+  local d; d="$(get_active_datadir)"
+  if [ -n "$d" ] && [ -r "$d/pg_hba.conf" ]; then
+    echo "$d/pg_hba.conf"; return
+  fi
+  # fallback to distro paths
   local v="$1" p
   p=$(find "/etc/postgresql/${v}" -maxdepth 3 -name pg_hba.conf 2>/dev/null | head -n1)
-  [[ -z "$p" ]] && p=$(find /etc/postgresql -maxdepth 4 -name pg_hba.conf 2>/dev/null | head -n1)
+  [ -z "$p" ] && p=$(find /etc/postgresql -maxdepth 4 -name pg_hba.conf 2>/dev/null | head -n1 || true)
   echo "$p"
 }
-find_postgresql_conf() {
+
+find_postgresql_conf_active() {
+  local d; d="$(get_active_datadir)"
+  if [ -n "$d" ] && [ -r "$d/postgresql.conf" ]; then
+    echo "$d/postgresql.conf"; return
+  fi
+  # fallback to distro paths
   local v="$1" p
   p=$(find "/etc/postgresql/${v}" -maxdepth 3 -name postgresql.conf 2>/dev/null | head -n1)
-  [[ -z "$p" ]] && p=$(find /etc/postgresql -maxdepth 4 -name postgresql.conf 2>/dev/null | head -n1)
+  [ -z "$p" ] && p=$(find /etc/postgresql -maxdepth 4 -name postgresql.conf 2>/dev/null | head -n1 || true)
   echo "$p"
 }
+
 extract_port_from_conf() {
   local conf="$1"
   [ -r "$conf" ] || { echo ""; return; }
@@ -72,22 +105,12 @@ extract_port_from_conf() {
     END{ if (p) print p }' "$conf"
 }
 
+# ---- Detect version / install if needed ----
 line "-" 72
 if command -v psql >/dev/null 2>&1; then
   INSTALLED_MAJOR="$(psql -V | awk '{print $3}' | cut -d. -f1)"
   PG_VERSION="${INSTALLED_MAJOR}"
   say "Detected PostgreSQL ${PG_VERSION} (reuse)."
-
-  # Detect actual port from postgresql.conf if present
-  PG_CONF="$(find_postgresql_conf "$PG_VERSION")"
-  if [ -n "$PG_CONF" ]; then
-    det_port="$(extract_port_from_conf "$PG_CONF")"
-    if [[ -n "$det_port" && "$det_port" =~ ^[0-9]+$ ]]; then
-      DB_PORT="$det_port"
-      say "Detected PostgreSQL port: ${DB_PORT}"
-      state_put_flag "pg_port" "$DB_PORT"
-    fi
-  fi
 else
   [[ -n "$PG_VERSION" ]] || { err "PG_VERSION is required."; }
   say "Installing PostgreSQL ${PG_VERSION} from PGDG..."
@@ -95,11 +118,24 @@ else
   ensure_postgres "$PG_VERSION"
 fi
 
-PG_HBA="$(find_pg_hba "$PG_VERSION")"
-[[ -n "$PG_HBA" ]] || { err "pg_hba.conf not found for major ${PG_VERSION}"; }
+# ---- Port detection from active postgresql.conf ----
+PG_CONF="$(find_postgresql_conf_active "$PG_VERSION")"
+if [ -n "$PG_CONF" ]; then
+  det_port="$(extract_port_from_conf "$PG_CONF")"
+  if [[ -n "$det_port" && "$det_port" =~ ^[0-9]+$ ]]; then
+    DB_PORT="$det_port"
+    say "Detected PostgreSQL port: ${DB_PORT}"
+    state_put_flag "pg_port" "$DB_PORT"
+  fi
+fi
 
+# ---- Active pg_hba.conf ----
+PG_HBA="$(find_pg_hba_active "$PG_VERSION")"
+[[ -n "$PG_HBA" ]] || { err "pg_hba.conf not found for major ${PG_VERSION}"; }
+say "Using pg_hba.conf: $PG_HBA"
+
+# ===== Temporary peer access for local postgres user =====
 NEED_RESTORE=0
-# Use --no-password to avoid interactive prompts; if it fails, we switch to temporary peer.
 if ! sudo -u postgres psql --no-password -tAc "SELECT 1" >/dev/null 2>&1; then
   bak="${PG_HBA}.bak.$(date +%s)"
   cp -a "$PG_HBA" "$bak"
@@ -110,7 +146,7 @@ if ! sudo -u postgres psql --no-password -tAc "SELECT 1" >/dev/null 2>&1; then
   # Replace any active line: "local ... postgres ... METHOD" -> peer
   sed -E 's/^([[:space:]]*local[[:space:]]+[^#]*[[:space:]]postgres[[:space:]]+)([[:alnum:]_+-]+)([[:space:]]*.*)$/\1peer\3/' "$PG_HBA" > "$tmp"
 
-  # If no change happened (no postgres local line), prepend a high-precedence peer rule
+  # If no change happened, prepend a high-precedence peer rule
   if cmp -s "$PG_HBA" "$tmp"; then
     { echo "local   all             postgres                                peer"; cat "$PG_HBA"; } > "${tmp}.2"
     mv "${tmp}.2" "$PG_HBA"
@@ -119,7 +155,14 @@ if ! sudo -u postgres psql --no-password -tAc "SELECT 1" >/dev/null 2>&1; then
     mv "$tmp" "$PG_HBA"
   fi
 
+  # Reload cluster (prefer cluster-aware reload)
+  if command -v pg_lsclusters >/dev/null 2>&1; then
+    while read -r ver name _; do
+      systemctl reload "postgresql@${ver}-${name}" 2>/dev/null || true
+    done < <(pg_lsclusters 2>/dev/null | awk 'NR>1{print $1" "$2}')
+  fi
   systemctl reload postgresql || systemctl restart postgresql
+
   sudo -u postgres psql --no-password -tAc "SELECT 1" >/dev/null 2>&1 || { err "psql inaccessible even after temporary peer rule"; }
 fi
 line "-" 72
@@ -142,8 +185,14 @@ EXISTS_DB=$(sudo -u postgres psql --no-password -tAc "SELECT 1 FROM pg_database 
 [[ "$EXISTS_DB" == "1" ]] || sudo -u postgres createdb --no-password -O "${DB_USER}" "${DB_NAME}"
 sudo -u postgres psql --no-password -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};"
 
+# ===== Restore pg_hba.conf if modified =====
 if [[ $NEED_RESTORE -eq 1 ]]; then
   cp -f "${PG_HBA}.bak."* "$PG_HBA" 2>/dev/null || true
+  if command -v pg_lsclusters >/dev/null 2>&1; then
+    while read -r ver name _; do
+      systemctl reload "postgresql@${ver}-${name}" 2>/dev/null || true
+    done < <(pg_lsclusters 2>/dev/null | awk 'NR>1{print $1" "$2}')
+  fi
   systemctl reload postgresql || systemctl restart postgresql
 fi
 
