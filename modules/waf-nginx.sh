@@ -89,15 +89,21 @@ if ! pkg-config --exists libmodsecurity; then
   say "Building libmodsecurity from source..."
   . /etc/os-release 2>/dev/null || true
   PCRE_PKGS="libpcre3 libpcre3-dev"
+  XML2_PKGS="libxml2 libxml2-dev"
   if { [ "${ID:-}" = "debian" ] && [ "${VERSION_CODENAME:-}" = "trixie" ]; } || \
      { [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_CODENAME:-}" = "noble" ]; }; then
     PCRE_PKGS="libpcre2-dev"
   elif [ "${ID:-}" = "debian" ] && [ "${VERSION_CODENAME:-}" = "bookworm" ]; then
     PCRE_PKGS="libpcre3 libpcre3-dev libpcre2-dev"
   fi
+
+  if { [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_CODENAME:-}" = "resolute" ]; }; then
+  	XML2_PKGS="libxml2-dev"
+   	PCRE_PKGS="libpcre2-dev"
+  fi
   apt install -y make gcc autoconf automake libtool gettext pkg-config \
     libcurl4-openssl-dev liblua5.3-dev $PCRE_PKGS \
-    libxml2 libxml2-dev libyajl-dev doxygen libgeoip-dev libssl-dev \
+    $XML2_PKGS libyajl-dev doxygen libgeoip-dev libssl-dev \
     zlib1g-dev libxslt1-dev liblmdb-dev libgd-dev git uuid-dev
 
   cd /usr/local/src
