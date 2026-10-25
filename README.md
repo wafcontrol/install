@@ -19,6 +19,52 @@ chmod +x install.sh
 ```bash
 sudo ./install.sh
 ```
+
+When running from a checkout, the installer uses the modules in the adjacent
+`modules/` directory. Setting `MODULE_BASE` explicitly selects remote modules
+instead. A standalone downloaded `install.sh` fetches remote modules as before.
+
+## Nginx / ModSecurity compatibility
+
+The Nginx installer uses the `modsecurity` pkg-config metadata to select the
+library and downloads `modsecurity.conf-recommended` and `unicode.mapping` from
+that exact v3 release. It installs `libmodsecurity-dev`, which resolves the
+runtime package name on each distribution (including `libmodsecurity3t64` on
+Ubuntu 24.04), and checks the configuration with Nginx before enabling it.
+
+Earlier installers could copy an Apache/v2 or newer configuration into Nginx.
+The error `Expecting a variable ... MULTIPART_DUPLICATE_PART_HEADER` means the
+configuration refers to a variable the loaded engine does not recognize. The
+variable was introduced in [ModSecurity v3.0.17](https://github.com/owasp-modsecurity/ModSecurity/releases/tag/v3.0.17);
+Ubuntu 24.04 packages [v3.0.12](https://packages.ubuntu.com/en/noble/libs/libmodsecurity3t64).
+The updated module backs up and repairs this diagnostic text on older engines,
+while retaining multipart strict validation and existing local settings.
+
+To repair this specific error on an already installed server without rerunning
+the application/database installation:
+
+```bash
+sudo bash <<'BASH'
+set -euo pipefail
+conf=/etc/nginx/modsec/modsecurity.conf
+backup="${conf}.bak.$(date +%s)"
+cp -a -- "$conf" "$backup"
+sed -i -E 's/DH[[:blank:]]+%\{MULTIPART_DUPLICATE_PART_HEADER\},[[:blank:]]*//g' "$conf"
+if nginx -t; then
+  systemctl reload nginx
+else
+  cp -a -- "$backup" "$conf"
+  exit 1
+fi
+BASH
+```
+
+Run the offline regression checks with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## Uninstall
 
 WAFControl provides an interactive and safe uninstallation process.

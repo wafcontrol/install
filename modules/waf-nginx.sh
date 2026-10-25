@@ -83,9 +83,12 @@ NGX_GROUP="$(id -gn "$NGX_USER" 2>/dev/null || echo "$NGX_USER")"
 say "Detected nginx user: $NGX_USER (group: $NGX_GROUP)"
 
 apt update -y
-apt install -y libmodsecurity3 libmodsecurity-dev || true
+# libmodsecurity-dev pulls in the correct runtime package, including the
+# libmodsecurity3t64 rename on Ubuntu 24.04 and Debian 13.
+apt install -y build-essential pkg-config libpcre2-dev zlib1g-dev libssl-dev git curl jq wget
+apt install -y libmodsecurity-dev || warn "Packaged ModSecurity unavailable; trying a source build."
 
-if ! pkg-config --exists libmodsecurity; then
+if ! pkg-config --exists modsecurity; then
   say "Building libmodsecurity from source..."
   . /etc/os-release 2>/dev/null || true
   PCRE_PKGS="libpcre3 libpcre3-dev"
@@ -106,9 +109,11 @@ if ! pkg-config --exists libmodsecurity; then
     $XML2_PKGS libyajl-dev doxygen libgeoip-dev libssl-dev \
     zlib1g-dev libxslt1-dev liblmdb-dev libgd-dev git uuid-dev
 
-  cd /usr/local/src
-  test -d ModSecurity || git clone --depth 1 --recursive -b v3/master https://github.com/SpiderLabs/ModSecurity
-  cd ModSecurity
+  # Use a release, so its configuration files can be retrieved by the same tag.
+  MODSEC_SOURCE=/usr/local/src/ModSecurity-v3.0.17
+  test -d "$MODSEC_SOURCE" || git clone --depth 1 --recursive -b v3.0.17 \
+    https://github.com/owasp-modsecurity/ModSecurity.git "$MODSEC_SOURCE"
+  cd "$MODSEC_SOURCE"
   git submodule sync --recursive
   git submodule update --init --recursive
   ./build.sh
@@ -116,12 +121,20 @@ if ! pkg-config --exists libmodsecurity; then
   make -j"$(nproc)"
   make install
   ldconfig
+  export PKG_CONFIG_PATH="/usr/local/modsecurity/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
   say "libmodsecurity built and installed."
 else
   say "libmodsecurity present via packages."
 fi
 
-test -d /usr/local/src/ModSecurity-nginx || git clone --depth 1 https://github.com/SpiderLabs/ModSecurity-nginx.git /usr/local/src/ModSecurity-nginx
+MODSEC_VERSION="$(pkg-config --modversion modsecurity)"
+[[ "$MODSEC_VERSION" =~ ^3\.[0-9]+\.[0-9]+$ ]] || { err "Unsupported ModSecurity version: $MODSEC_VERSION"; exit 1; }
+# Make the connector use the same library whose version selects the template.
+export MODSECURITY_INC="$(pkg-config --variable=includedir modsecurity)"
+export MODSECURITY_LIB="$(pkg-config --variable=libdir modsecurity)"
+say "Using ModSecurity v${MODSEC_VERSION} (${MODSECURITY_LIB})."
+
+test -d /usr/local/src/ModSecurity-nginx || git clone --depth 1 https://github.com/owasp-modsecurity/ModSecurity-nginx.git /usr/local/src/ModSecurity-nginx
 NVER="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" || NVER=""
 [[ -n "$NVER" ]] || { err "Cannot detect Nginx version."; exit 1; }
 
@@ -148,7 +161,7 @@ say "Using modules dir: $MOD_DIR"
 mkdir -p /usr/local/src/nginx && cd /usr/local/src/nginx
 if [[ ! -d "nginx-${NVER}" ]]; then
   say "Fetching nginx source: ${NVER}"
-  wget -q "http://nginx.org/download/nginx-${NVER}.tar.gz"
+  wget -q "https://nginx.org/download/nginx-${NVER}.tar.gz"
   tar -xzf "nginx-${NVER}.tar.gz"
 fi
 
@@ -163,12 +176,6 @@ state_append_array CREATED_FILES "$MOD_DIR/ngx_http_modsecurity_module.so"
 say "Dynamic module built."
 
 TS="$(date +%s)"
-if ! grep -q 'ngx_http_modsecurity_module.so' "$NGX_MAIN" 2>/dev/null; then
-  cp -a "$NGX_MAIN" "${NGX_MAIN}.bak.${TS}"
-  state_put_map BACKUPS "$NGX_MAIN" "${NGX_MAIN}.bak.${TS}"
-  sed -i "1iload_module ${MOD_DIR}/ngx_http_modsecurity_module.so;" "$NGX_MAIN"
-  say "Injected load_module into nginx.conf"
-fi
 
 find_http_file() {
   if grep -q '^[[:space:]]*http[[:space:]]*{' "$NGX_MAIN"; then
@@ -188,49 +195,43 @@ HTTP_FILE="$(find_http_file)"
 MDIR="/etc/nginx/modsec"
 mkdir -p "$MDIR"
 
-copy_recommended_modsec_conf() {
-  local c
-  for c in \
-    "/etc/modsecurity/modsecurity.conf-recommended" \
-    "/usr/share/doc/modsecurity-crs/examples/modsecurity.conf-recommended" \
-    "/usr/share/doc/modsecurity-crs/examples/modsecurity.conf-recommended.gz" \
-    "/usr/local/src/ModSecurity/modsecurity.conf-recommended"
-  do
-    if [[ -f "$c" ]]; then
-      if [[ "$c" == *.gz ]]; then
-        zcat "$c" > "$MDIR/modsecurity.conf"
-      else
-        cp -f "$c" "$MDIR/modsecurity.conf"
-      fi
-      return 0
+fetch_modsecurity_defaults() {
+  local staging asset
+  staging="$(mktemp -d "$MDIR/.defaults.XXXXXX")" || return 1
+  for asset in modsecurity.conf-recommended unicode.mapping; do
+    if ! curl -fLsS --retry 3 --connect-timeout 15 --max-time 120 \
+      "https://raw.githubusercontent.com/owasp-modsecurity/ModSecurity/v${MODSEC_VERSION}/${asset}" \
+      -o "$staging/$asset" || [[ ! -s "$staging/$asset" ]]; then
+      rm -rf "$staging"
+      err "Cannot fetch ${asset} for ModSecurity v${MODSEC_VERSION}."
+      return 1
     fi
   done
-  return 1
+  if [[ ! -f "$MDIR/modsecurity.conf" ]]; then
+    cp "$staging/modsecurity.conf-recommended" "$MDIR/modsecurity.conf"
+  fi
+  [[ -f "$MDIR/unicode.mapping" ]] || cp "$staging/unicode.mapping" "$MDIR/unicode.mapping"
+  rm -rf "$staging"
 }
 
-if [[ ! -f "$MDIR/modsecurity.conf" ]]; then
-  if copy_recommended_modsec_conf; then
-    say "modsecurity.conf created from recommended template."
-  else
-    cat > "$MDIR/modsecurity.conf" <<'CONF'
-SecRuleEngine On
-SecRequestBodyAccess On
-SecResponseBodyAccess Off
-CONF
-    warn "Using minimal modsecurity.conf fallback."
-  fi
+if [[ ! -f "$MDIR/modsecurity.conf" || ! -f "$MDIR/unicode.mapping" ]]; then
+  fetch_modsecurity_defaults
+  say "ModSecurity defaults prepared from matching v${MODSEC_VERSION} release."
 fi
 
-for um in \
-  "/etc/modsecurity/unicode.mapping" \
-  "/usr/share/doc/modsecurity-crs/examples/unicode.mapping" \
-  "/usr/local/src/ModSecurity/unicode.mapping"
-do
-  if [[ -f "$um" ]]; then
-    cp -f "$um" "$MDIR/unicode.mapping"
-    break
-  fi
-done
+# Repair the template copied by earlier installers without replacing local
+# settings or removing rule 200003 (multipart strict validation). This variable
+# was added in v3.0.17; on older engines only its diagnostic text is unsupported.
+if dpkg --compare-versions "$MODSEC_VERSION" lt 3.0.17 && \
+   grep -qE 'DH[[:blank:]]+%\{MULTIPART_DUPLICATE_PART_HEADER\},' "$MDIR/modsecurity.conf"; then
+  cp -a "$MDIR/modsecurity.conf" "$MDIR/modsecurity.conf.bak.${TS}"
+  state_put_map BACKUPS "$MDIR/modsecurity.conf" "$MDIR/modsecurity.conf.bak.${TS}"
+  sed -i -E 's/DH[[:blank:]]+%\{MULTIPART_DUPLICATE_PART_HEADER\},[[:blank:]]*//g' "$MDIR/modsecurity.conf"
+  say "Repaired incompatible multipart log variable for ModSecurity v${MODSEC_VERSION}."
+fi
+
+# Nginx's prefix is not the ModSecurity configuration directory.
+sed -i -E "s|^([[:blank:]]*SecUnicodeMapFile[[:blank:]]+)unicode.mapping([[:blank:]]+)|\1${MDIR}/unicode.mapping\2|" "$MDIR/modsecurity.conf"
 
 sed -i -E 's/^\s*SecRuleEngine\s+DetectionOnly/SecRuleEngine On/i' "$MDIR/modsecurity.conf" || true
 grep -qE '^\s*SecRuleEngine\s+' "$MDIR/modsecurity.conf" || echo "SecRuleEngine On" >> "$MDIR/modsecurity.conf"
@@ -241,6 +242,39 @@ if [[ ! -f "$MAIN" ]]; then
 fi
 state_append_array CREATED_FILES "$MAIN"
 state_append_array CREATED_FILES "$MDIR/modsecurity.conf"
+state_append_array CREATED_FILES "$MDIR/unicode.mapping"
+
+# Parse the base configuration with the actual connector before enabling it in
+# nginx.conf, so an incompatible template fails before changing the load setup.
+validate_modsecurity_conf() {
+  local staging result=0
+  staging="$(mktemp -d -t wafcontrol-nginx-check-XXXXXX)" || return 1
+  cat > "$staging/nginx.conf" <<CONF
+load_module ${MOD_DIR}/ngx_http_modsecurity_module.so;
+pid ${staging}/nginx.pid;
+error_log stderr;
+events {}
+http {
+    access_log off;
+    modsecurity on;
+    modsecurity_rules_file ${MDIR}/modsecurity.conf;
+}
+CONF
+  nginx -t -e stderr -p "$staging/" -c "$staging/nginx.conf" || result=$?
+  rm -rf "$staging"
+  return "$result"
+}
+if ! validate_modsecurity_conf; then
+  err "ModSecurity v${MODSEC_VERSION} rejected its base configuration. Nginx was not restarted."
+  exit 1
+fi
+
+if ! grep -q 'ngx_http_modsecurity_module.so' "$NGX_MAIN" 2>/dev/null; then
+  cp -a "$NGX_MAIN" "${NGX_MAIN}.bak.${TS}"
+  state_put_map BACKUPS "$NGX_MAIN" "${NGX_MAIN}.bak.${TS}"
+  sed -i "1iload_module ${MOD_DIR}/ngx_http_modsecurity_module.so;" "$NGX_MAIN"
+  say "Injected load_module into nginx.conf"
+fi
 
 if ! grep -q 'WAFCONTROL-BEGIN' "$HTTP_FILE"; then
   cp -a "$HTTP_FILE" "${HTTP_FILE}.bak.${TS}"

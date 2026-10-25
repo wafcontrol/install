@@ -19,6 +19,10 @@ trap 'err "Failed on line $LINENO"' ERR
 [[ $EUID -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
 
+LOCAL_MODULE_DIR=""
+if [[ -z "${MODULE_BASE:-}" && -f "${BASH_SOURCE[0]:-}" ]]; then
+  LOCAL_MODULE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/modules"
+fi
 MODULE_BASE="${MODULE_BASE:-https://raw.githubusercontent.com/wafcontrol/install/refs/heads/main/modules/}"
 STATE_DIR="${STATE_DIR:-/var/lib/wafcontrol-installer}"
 STATE_FILE="${STATE_FILE:-$STATE_DIR/state.env}"
@@ -43,6 +47,11 @@ state_put_flag()     { printf 'FLAGS[%q]=%q\n' "$1" "$2" >> "$STATE_FILE"; }
 
 fetch_and_run() {
   local mod="${1:?module name required}"
+  if [[ -n "$LOCAL_MODULE_DIR" && -f "$LOCAL_MODULE_DIR/$mod" ]]; then
+    banner "Running local module: ${mod}"
+    bash "$LOCAL_MODULE_DIR/$mod"
+    return
+  fi
   local url="${MODULE_BASE}/${mod}"
   banner "Fetching module: ${mod}"
   curl -fsSL "$url" | bash
