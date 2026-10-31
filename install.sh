@@ -122,6 +122,80 @@ ensure_python_ubuntu() {
   esac
 }
 
+# The application's pinned NumPy/ContourPy releases support CPython 3.10-3.13.
+# Ubuntu 26.04 defaults to 3.14, which otherwise forces unsupported source builds.
+app_python_supported() {
+  "$1" -c 'import sys, sysconfig; sys.exit(not ((3, 10) <= sys.version_info[:2] < (3, 14) and not sysconfig.get_config_var("Py_GIL_DISABLED")))' >/dev/null 2>&1
+}
+
+ensure_app_python() {
+  local candidate version=3.13.18
+  local checksum=99dbc847fb6a3fb26358370fb4c591215864116ebb584f2b89ab0b74c51dfa2a
+  local prefix="/usr/local/lib/wafcontrol-python/$version"
+  if [[ -n "${APP_PYTHON:-}" ]]; then
+    app_python_supported "$APP_PYTHON" || { err 'APP_PYTHON must be a working Python 3.10-3.13 interpreter with the GIL enabled.'; return 1; }
+    return
+  fi
+  for candidate in "$VENV_DIR/bin/python" python3 python3.13 python3.12 python3.11 python3.10 "$prefix/bin/python3.13"; do
+    if app_python_supported "$candidate"; then APP_PYTHON="$candidate"; return; fi
+  done
+  [[ ! -e "$prefix" ]] || { err "Incomplete Python installation at $prefix; review it before retrying."; return 1; }
+  say "Building application Python $version separately from system Python (one build job)."
+  apt-get install -y --no-install-recommends build-essential pkg-config curl ca-certificates \
+    libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev \
+    liblzma-dev libgdbm-dev libncurses-dev uuid-dev
+  (
+    set -e
+    build_dir=$(mktemp -d -t wafcontrol-python-XXXXXXXX)
+    trap 'rm -rf -- "$build_dir"' EXIT
+    curl --proto '=https' -fLsS --retry 3 \
+      "https://www.python.org/ftp/python/$version/Python-$version.tgz" -o "$build_dir/python.tgz"
+    printf '%s  %s\n' "$checksum" "$build_dir/python.tgz" | sha256sum -c -
+    tar --no-same-owner -xzf "$build_dir/python.tgz" -C "$build_dir"
+    cd "$build_dir/Python-$version"
+    ./configure --prefix="$prefix" --with-ensurepip=install --disable-test-modules
+    make -j1
+    ./python -c 'import ssl, hashlib, zlib, bz2, lzma, ctypes, sqlite3, venv, ensurepip'
+    make -j1 DESTDIR="$build_dir/install" COMPILEALL_OPTS=-j1 altinstall
+    install -d -m 0755 "$(dirname "$prefix")"
+    mv "$build_dir/install$prefix" "$prefix"
+    state_append_array CREATED_FILES "$prefix"
+  )
+  APP_PYTHON="$prefix/bin/python3.13"
+  app_python_supported "$APP_PYTHON" || { err 'The application Python failed runtime verification.'; return 1; }
+}
+
+prepare_python_environment() (
+  set -e
+  backup=""; existed=0; result=0
+  trap 'result=$?; if [[ $result != 0 && -n "$backup" ]]; then rm -rf -- "$VENV_DIR"; mv -- "$backup" "$VENV_DIR"; err "Previous virtualenv restored after Python setup failed."; fi' EXIT
+  if [[ -e "$VENV_DIR" || -L "$VENV_DIR" ]]; then
+    existed=1
+    if ! app_python_supported "$VENV_DIR/bin/python"; then
+      backup_path=$(mktemp -d "$VENV_DIR.incompatible.XXXXXXXX")
+      rmdir "$backup_path"
+      mv -- "$VENV_DIR" "$backup_path"
+      backup="$backup_path"
+      say "Previous incompatible virtualenv preserved at $backup"
+    fi
+  fi
+  if [[ ! -d "$VENV_DIR" ]]; then
+    say "Creating virtualenv with $("$APP_PYTHON" --version)..."
+    "$APP_PYTHON" -m venv "$VENV_DIR"
+  fi
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip wheel setuptools
+  if [[ -f "$APP_DIR/requirements.txt" ]]; then
+    say "Installing Python requirements..."
+    "$VENV_DIR/bin/python" -m pip install -r "$APP_DIR/requirements.txt"
+  else
+    warn "requirements.txt not found. Installing minimal stack..."
+    "$VENV_DIR/bin/python" -m pip install "Django>=5" gunicorn celery
+  fi
+  "$VENV_DIR/bin/python" -m pip install django-environ "psycopg[binary]>=3.1" || \
+    "$VENV_DIR/bin/python" -m pip install psycopg2-binary
+  if [[ $existed == 0 ]]; then state_append_array CREATED_FILES "$VENV_DIR"; fi
+)
+
 gen_pass() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -base64 64 | tr -d '\n' | tr '/+=' '___' | tr -d "'" | cut -c1-50
@@ -432,6 +506,9 @@ apt-get install -y --no-install-recommends \
   build-essential git pkg-config jq wget tar sed grep procps \
   libpq-dev redis-server openssl
 
+ensure_app_python
+say "Using application Python: $APP_PYTHON ($("$APP_PYTHON" --version))"
+
 banner "Fetching project and preparing Python environment" "=" 72
 mkdir -p "$APP_DIR"
 if [[ -d "$APP_DIR/.git" || -f "$APP_DIR/manage.py" ]]; then
@@ -442,24 +519,8 @@ else
   state_append_array CREATED_FILES "$APP_DIR"
 fi
 
-if [[ ! -d "$VENV_DIR" ]]; then
-  say "Creating virtualenv..."
-  python3 -m venv "$VENV_DIR"
-  state_append_array CREATED_FILES "$VENV_DIR"
-fi
-
+prepare_python_environment
 source "${VENV_DIR}/bin/activate"
-python -m pip install --upgrade pip wheel setuptools
-
-REQ_FILE="${APP_DIR}/requirements.txt"
-if [[ -f "$REQ_FILE" ]]; then
-  say "Installing Python requirements..."
-  pip install -r "$REQ_FILE"
-else
-  warn "requirements.txt not found. Installing minimal stack..."
-  pip install "Django>=5" gunicorn celery
-fi
-pip install django-environ "psycopg[binary]>=3.1" || pip install psycopg2-binary
 
 export APP_USER APP_DIR VENV_DIR RUNTIME_DIR
 export SERVER MODE DOMAIN HTTP_PORT
