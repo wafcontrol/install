@@ -22,6 +22,7 @@ STATE_FILE="${STATE_FILE:-$STATE_DIR/state.env}"
 mkdir -p "$STATE_DIR"; touch "$STATE_FILE"
 state_append_array() { printf '%s+=(%q)\n' "$1" "$2" >> "$STATE_FILE"; }
 state_put_map()      { printf '%s[%q]=%q\n' "$1" "$2" "$3" >> "$STATE_FILE"; }
+# shellcheck disable=SC1090
 source "$STATE_FILE" 2>/dev/null || true
 
 APP_DIR="${APP_DIR:?}"
@@ -40,14 +41,68 @@ BASIC_AUTH_PASS="${BASIC_AUTH_PASS:-}"
 
 banner "Nginx + ModSecurity v3 + CRS" "=" 72
 
+# shellcheck source=/dev/null
+. /etc/os-release
+case "${ID:-}:${VERSION_CODENAME:-}" in
+  ubuntu:jammy|ubuntu:noble|ubuntu:resolute|debian:bookworm|debian:trixie) ;;
+  *) err "Unsupported distribution: ${ID:-unknown} ${VERSION_ID:-unknown}. Expected Ubuntu 22.04/24.04/26.04 or Debian 12/13."; exit 1 ;;
+esac
+
+# Keep backups for every configuration/module path changed below. An unsuccessful
+# run restores files before attempting to activate any previous configuration.
+BACKUP_DIR=$(mktemp -d "$STATE_DIR/nginx-backup.XXXXXXXX")
+BUILD_TMP=$(mktemp -d -t wafcontrol-nginx-build-XXXXXXXX)
+declare -A SAVED_PATHS=()
+declare -a SAVED_FILES=() SAVED_EXISTING=()
+DEPLOYED=0; ACTIVATION_ATTEMPTED=0; NGINX_WAS_ACTIVE=0
+if systemctl is-active --quiet nginx; then NGINX_WAS_ACTIVE=1; fi
+backup_nginx_file() {
+  local path=$1 index=${#SAVED_FILES[@]}
+  [[ ! ${SAVED_PATHS[$path]+saved} ]] || return 0
+  [[ ! -d "$path" || -L "$path" ]] || { err "Expected a file, got a directory: $path"; return 1; }
+  SAVED_PATHS[$path]=1; SAVED_FILES+=("$path"); SAVED_EXISTING+=(0)
+  if [[ -e "$path" || -L "$path" ]]; then
+    cp -a -- "$path" "$BACKUP_DIR/$index"
+    SAVED_EXISTING[index]=1
+    [[ "$path" == "$STATE_FILE" ]] || state_put_map BACKUPS "$path" "$BACKUP_DIR/$index"
+  else state_append_array CREATED_FILES "$path"; fi
+}
+finish_nginx_install() {
+  local result=$? index path temporary
+  trap - EXIT INT TERM
+  if [[ $DEPLOYED == 0 ]]; then
+    for ((index=${#SAVED_FILES[@]}-1; index>=0; index--)); do
+      path=${SAVED_FILES[$index]}
+      if [[ ${SAVED_EXISTING[$index]} == 1 ]]; then
+        temporary=$(mktemp "$path.restore.XXXXXX")
+        rm -f -- "$temporary"
+        cp -a -- "$BACKUP_DIR/$index" "$temporary"
+        mv -Tf -- "$temporary" "$path"
+      else rm -f -- "$path"; fi
+    done
+    if [[ $ACTIVATION_ATTEMPTED == 1 ]]; then
+      if [[ $NGINX_WAS_ACTIVE == 1 ]]; then
+        if nginx -t; then systemctl restart nginx; else err 'Previous files restored, but their configuration needs administrator review.'; fi
+      else systemctl stop nginx; fi
+    fi
+    err "Installation failed; previous configuration restored. Backups: $BACKUP_DIR"
+    [[ $result != 0 ]] || result=1
+  fi
+  rm -rf -- "$BUILD_TMP"
+  exit "$result"
+}
+trap finish_nginx_install EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+backup_nginx_file "$STATE_FILE"
+
 if ! command -v nginx >/dev/null 2>&1; then
   say "Installing Nginx from nginx.org..."
   curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
-  . /etc/os-release
   echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/${ID} ${VERSION_CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list
   apt update -y
   apt install -y nginx
-  systemctl enable --now nginx
+  systemctl enable nginx
 else
   say "Nginx detected."
 fi
@@ -83,55 +138,72 @@ NGX_GROUP="$(id -gn "$NGX_USER" 2>/dev/null || echo "$NGX_USER")"
 say "Detected nginx user: $NGX_USER (group: $NGX_GROUP)"
 
 apt update -y
-# libmodsecurity-dev pulls in the correct runtime package, including the
-# libmodsecurity3t64 rename on Ubuntu 24.04 and Debian 13.
-apt install -y build-essential pkg-config libpcre2-dev zlib1g-dev libssl-dev git curl jq wget
-apt install -y libmodsecurity-dev || warn "Packaged ModSecurity unavailable; trying a source build."
+# Development packages resolve runtime names (t64, libxml2-16) per distribution.
+# Do not install libmodsecurity-dev: finding its metadata does not prove that
+# its engine supports the selected template.
+apt install -y build-essential pkg-config libpcre2-dev libxml2-dev zlib1g-dev libssl-dev git curl jq wget
+MODSEC_VERSION=3.0.17
+MODSEC_PREFIX="/usr/local/modsecurity/$MODSEC_VERSION"
+MODSEC_SHA256=f283b33d5c21130fd3a15c84a93a1abe12bd1949edaf44288b12af571b671a50
+curl --proto '=https' -fLsS --retry 3 \
+  "https://github.com/owasp-modsecurity/ModSecurity/releases/download/v${MODSEC_VERSION}/modsecurity-v${MODSEC_VERSION}.tar.gz" \
+  -o "$BUILD_TMP/modsecurity.tar.gz"
+printf '%s  %s\n' "$MODSEC_SHA256" "$BUILD_TMP/modsecurity.tar.gz" | sha256sum -c -
+tar --no-same-owner -xzf "$BUILD_TMP/modsecurity.tar.gz" -C "$BUILD_TMP"
+MODSEC_SOURCE="$BUILD_TMP/modsecurity-v$MODSEC_VERSION"
 
-if ! pkg-config --exists modsecurity; then
-  say "Building libmodsecurity from source..."
-  . /etc/os-release 2>/dev/null || true
-  PCRE_PKGS="libpcre3 libpcre3-dev"
-  XML2_PKGS="libxml2 libxml2-dev"
-  if { [ "${ID:-}" = "debian" ] && [ "${VERSION_CODENAME:-}" = "trixie" ]; } || \
-     { [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_CODENAME:-}" = "noble" ]; }; then
-    PCRE_PKGS="libpcre2-dev"
-  elif [ "${ID:-}" = "debian" ] && [ "${VERSION_CODENAME:-}" = "bookworm" ]; then
-    PCRE_PKGS="libpcre3 libpcre3-dev libpcre2-dev"
-  fi
+verify_modsecurity() {
+  local include=$1 library=$2 linked identity
+  [[ -f "$include/modsecurity/modsecurity.h" && -f "$library/libmodsecurity.so.3" ]] || return 1
+  cc -x c - -I"$include" -L"$library" -Wl,-rpath,"$library" -lmodsecurity -o "$BUILD_TMP/engine-check" <<'C' || return 1
+#include <stdio.h>
+#include <modsecurity/modsecurity.h>
+int main(void) {
+    ModSecurity *engine = msc_init();
+    if (!engine) return 1;
+    puts(msc_who_am_i(engine));
+    msc_cleanup(engine);
+    return 0;
+}
+C
+  linked=$(ldd "$BUILD_TMP/engine-check" | awk '$1=="libmodsecurity.so.3" {print $3}') || return 1
+  [[ $(readlink -f "$linked") == "$(readlink -f "$library/libmodsecurity.so.3")" ]] || return 1
+  identity=$("$BUILD_TMP/engine-check") || return 1
+  [[ "$identity" == "ModSecurity v$MODSEC_VERSION "* ]] || return 1
+  say "Verified actual engine: $identity ($library)."
+}
 
-  if { [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_CODENAME:-}" = "resolute" ]; }; then
-  	XML2_PKGS="libxml2-dev"
-   	PCRE_PKGS="libpcre2-dev"
-  fi
-  apt install -y make gcc autoconf automake libtool gettext pkg-config \
-    libcurl4-openssl-dev liblua5.3-dev $PCRE_PKGS \
-    $XML2_PKGS libyajl-dev doxygen libgeoip-dev libssl-dev \
-    zlib1g-dev libxslt1-dev liblmdb-dev libgd-dev git uuid-dev
-
-  # Use a release, so its configuration files can be retrieved by the same tag.
-  MODSEC_SOURCE=/usr/local/src/ModSecurity-v3.0.17
-  test -d "$MODSEC_SOURCE" || git clone --depth 1 --recursive -b v3.0.17 \
-    https://github.com/owasp-modsecurity/ModSecurity.git "$MODSEC_SOURCE"
-  cd "$MODSEC_SOURCE"
-  git submodule sync --recursive
-  git submodule update --init --recursive
-  ./build.sh
-  ./configure
-  make -j"$(nproc)"
-  make install
-  ldconfig
-  export PKG_CONFIG_PATH="/usr/local/modsecurity/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-  say "libmodsecurity built and installed."
+if verify_modsecurity "$MODSEC_PREFIX/include" "$MODSEC_PREFIX/lib"; then
+  MODSECURITY_INC="$MODSEC_PREFIX/include"; MODSECURITY_LIB="$MODSEC_PREFIX/lib"
+elif pkg-config --exists modsecurity && \
+     [[ $(pkg-config --modversion modsecurity) == "$MODSEC_VERSION" ]] && \
+     verify_modsecurity "$(pkg-config --variable=includedir modsecurity)" "$(pkg-config --variable=libdir modsecurity)"; then
+  MODSECURITY_INC=$(pkg-config --variable=includedir modsecurity)
+  MODSECURITY_LIB=$(pkg-config --variable=libdir modsecurity)
 else
-  say "libmodsecurity present via packages."
+  say "Existing pkg-config engine: $(pkg-config --modversion modsecurity 2>/dev/null || echo absent); building verified v$MODSEC_VERSION."
+  [[ ! -e "$MODSEC_PREFIX" ]] || { err "Unverified/partial engine prefix exists: $MODSEC_PREFIX; review it before retrying."; exit 1; }
+  apt install -y autoconf automake libtool gettext libcurl4-openssl-dev \
+    liblua5.4-dev libyajl-dev liblmdb-dev libmaxminddb-dev libfuzzy-dev
+  (
+    cd "$MODSEC_SOURCE"
+    ./configure --prefix="$MODSEC_PREFIX" --with-pcre2 --with-libxml --with-yajl --disable-static --disable-examples
+    make -j"${BUILD_JOBS:-2}"
+    make DESTDIR="$BUILD_TMP/install" install
+  )
+  verify_modsecurity "$BUILD_TMP/install$MODSEC_PREFIX/include" "$BUILD_TMP/install$MODSEC_PREFIX/lib" || {
+    err 'The built ModSecurity library failed runtime verification.'; exit 1;
+  }
+  install -d -m 0755 "$(dirname "$MODSEC_PREFIX")"
+  mv "$BUILD_TMP/install$MODSEC_PREFIX" "$MODSEC_PREFIX"
+  ldconfig -n "$MODSEC_PREFIX/lib"
+  MODSECURITY_INC="$MODSEC_PREFIX/include"; MODSECURITY_LIB="$MODSEC_PREFIX/lib"
 fi
-
-MODSEC_VERSION="$(pkg-config --modversion modsecurity)"
-[[ "$MODSEC_VERSION" =~ ^3\.[0-9]+\.[0-9]+$ ]] || { err "Unsupported ModSecurity version: $MODSEC_VERSION"; exit 1; }
-# Make the connector use the same library whose version selects the template.
-export MODSECURITY_INC="$(pkg-config --variable=includedir modsecurity)"
-export MODSECURITY_LIB="$(pkg-config --variable=libdir modsecurity)"
+export MODSECURITY_INC MODSECURITY_LIB
+MODSEC_LIBRARY=$(readlink -f "$MODSECURITY_LIB/libmodsecurity.so.3")
+# The connector's RUNPATH selects this library without changing the global
+# loader configuration or the library chosen by other applications.
+verify_modsecurity "$MODSECURITY_INC" "$MODSECURITY_LIB" || { err 'Selected runtime library changed unexpectedly.'; exit 1; }
 say "Using ModSecurity v${MODSEC_VERSION} (${MODSECURITY_LIB})."
 
 test -d /usr/local/src/ModSecurity-nginx || git clone --depth 1 https://github.com/owasp-modsecurity/ModSecurity-nginx.git /usr/local/src/ModSecurity-nginx
@@ -157,31 +229,49 @@ detect_modules_dir() {
 
 MOD_DIR="$(detect_modules_dir)"
 say "Using modules dir: $MOD_DIR"
+NGX_MODULE="$MOD_DIR/wafcontrol/${MODSEC_VERSION}-${NVER}-$(sha256sum "$(command -v nginx)" | cut -c1-16)/ngx_http_modsecurity_module.so"
+if dpkg --compare-versions "$NVER" lt 1.21.5; then apt install -y libpcre3-dev; fi
+# Replay plain feature switches as argv, never evaluate nginx -V as shell code.
+read -r -a NGINX_ARGUMENTS <<< "$(nginx -V 2>&1 | sed -n 's/^configure arguments: //p')"
+NGINX_FEATURES=()
+for argument in "${NGINX_ARGUMENTS[@]}"; do
+  if [[ "$argument" =~ ^--(with|without)-[A-Za-z0-9_-]+$ && "$argument" != --with-compat ]]; then NGINX_FEATURES+=("$argument"); fi
+done
+for feature in "${NGINX_FEATURES[@]}"; do
+  case "$feature" in
+    --with-http_xslt_module) apt install -y libxslt1-dev ;;
+    --with-http_image_filter_module) apt install -y libgd-dev ;;
+    --with-http_perl_module) apt install -y libperl-dev ;;
+    --with-http_geoip_module|--with-stream_geoip_module) apt install -y libgeoip-dev ;;
+  esac
+done
 
 mkdir -p /usr/local/src/nginx && cd /usr/local/src/nginx
 if [[ ! -d "nginx-${NVER}" ]]; then
   say "Fetching nginx source: ${NVER}"
   wget -q "https://nginx.org/download/nginx-${NVER}.tar.gz"
-  tar -xzf "nginx-${NVER}.tar.gz"
+  tar --no-same-owner -xzf "nginx-${NVER}.tar.gz"
 fi
 
-apt-get build-dep -y nginx || true
 cd "nginx-${NVER}"
-./configure --with-compat --add-dynamic-module=/usr/local/src/ModSecurity-nginx
-make modules
+./configure "${NGINX_FEATURES[@]}" --with-compat \
+  --with-ld-opt="-Wl,-rpath,$MODSECURITY_LIB" --add-dynamic-module=/usr/local/src/ModSecurity-nginx
+make -B modules
+LINKED_LIBRARY=$(ldd objs/ngx_http_modsecurity_module.so | awk '$1=="libmodsecurity.so.3" {print $3}')
+[[ $(readlink -f "$LINKED_LIBRARY") == "$MODSEC_LIBRARY" ]] || { err 'Connector links an unexpected ModSecurity library.'; exit 1; }
 
-install -d -m 0755 "$MOD_DIR"
-cp -f objs/ngx_http_modsecurity_module.so "$MOD_DIR/ngx_http_modsecurity_module.so"
-state_append_array CREATED_FILES "$MOD_DIR/ngx_http_modsecurity_module.so"
+install -d -m 0755 "$(dirname "$NGX_MODULE")"
+backup_nginx_file "$NGX_MODULE"
+MODULE_TMP=$(mktemp "$NGX_MODULE.XXXXXX")
+install -m 0644 objs/ngx_http_modsecurity_module.so "$MODULE_TMP"
+mv -Tf -- "$MODULE_TMP" "$NGX_MODULE"
 say "Dynamic module built."
-
-TS="$(date +%s)"
 
 find_http_file() {
   if grep -q '^[[:space:]]*http[[:space:]]*{' "$NGX_MAIN"; then
     echo "$NGX_MAIN"; return
   fi
-  awk 'BEGIN{h=0}/^[[:space:]]*http[[:space:]]*$/ {h=1} h && /^[[:space:]]*{/ {print FILENAME; exit}' "$NGX_MAIN" >/dev/null 2>&1 && { echo "$NGX_MAIN"; return; }
+  awk 'BEGIN{h=0}/^[[:space:]]*http[[:space:]]*$/ {h=1} h && /^[[:space:]]*{/ {found=1; exit} END {exit !found}' "$NGX_MAIN" && { echo "$NGX_MAIN"; return; }
   local f
   f="$(grep -RIl --include='*.conf' '^[[:space:]]*http[[:space:]]*{' /etc/nginx 2>/dev/null | head -n1 || true)"
   [[ -n "$f" ]] && { echo "$f"; return; }
@@ -199,9 +289,7 @@ fetch_modsecurity_defaults() {
   local staging asset
   staging="$(mktemp -d "$MDIR/.defaults.XXXXXX")" || return 1
   for asset in modsecurity.conf-recommended unicode.mapping; do
-    if ! curl -fLsS --retry 3 --connect-timeout 15 --max-time 120 \
-      "https://raw.githubusercontent.com/owasp-modsecurity/ModSecurity/v${MODSEC_VERSION}/${asset}" \
-      -o "$staging/$asset" || [[ ! -s "$staging/$asset" ]]; then
+    if ! cp "$MODSEC_SOURCE/$asset" "$staging/$asset" || [[ ! -s "$staging/$asset" ]]; then
       rm -rf "$staging"
       err "Cannot fetch ${asset} for ModSecurity v${MODSEC_VERSION}."
       return 1
@@ -214,35 +302,46 @@ fetch_modsecurity_defaults() {
   rm -rf "$staging"
 }
 
+backup_nginx_file "$MDIR/modsecurity.conf"
+backup_nginx_file "$MDIR/unicode.mapping"
 if [[ ! -f "$MDIR/modsecurity.conf" || ! -f "$MDIR/unicode.mapping" ]]; then
   fetch_modsecurity_defaults
   say "ModSecurity defaults prepared from matching v${MODSEC_VERSION} release."
 fi
 
-# Repair the template copied by earlier installers without replacing local
-# settings or removing rule 200003 (multipart strict validation). This variable
-# was added in v3.0.17; on older engines only its diagnostic text is unsupported.
-if dpkg --compare-versions "$MODSEC_VERSION" lt 3.0.17 && \
-   grep -qE 'DH[[:blank:]]+%\{MULTIPART_DUPLICATE_PART_HEADER\},' "$MDIR/modsecurity.conf"; then
-  cp -a "$MDIR/modsecurity.conf" "$MDIR/modsecurity.conf.bak.${TS}"
-  state_put_map BACKUPS "$MDIR/modsecurity.conf" "$MDIR/modsecurity.conf.bak.${TS}"
-  sed -i -E 's/DH[[:blank:]]+%\{MULTIPART_DUPLICATE_PART_HEADER\},[[:blank:]]*//g' "$MDIR/modsecurity.conf"
-  say "Repaired incompatible multipart log variable for ModSecurity v${MODSEC_VERSION}."
+# Retain strict multipart validation and restore diagnostics removed by older
+# installers. The actual engine has already been verified to implement them.
+STRICT_ID_PATTERN="id:[[:space:]]*['\"]?200003([^0-9]|$)"
+if ! grep -qE '^[[:space:]]*SecRule[[:space:]]+MULTIPART_STRICT_ERROR[[:space:]]' "$MDIR/modsecurity.conf"; then
+  if grep -qE "$STRICT_ID_PATTERN" "$MDIR/modsecurity.conf"; then
+    err 'Custom rule 200003 conflicts with strict multipart validation.'; exit 1
+  fi
+  awk '/^SecRule MULTIPART_STRICT_ERROR /{copy=1} copy {print; if ($0 !~ /\\$/) exit}' \
+    "$MODSEC_SOURCE/modsecurity.conf-recommended" >> "$MDIR/modsecurity.conf"
+fi
+if ! grep -Fq '%{MULTIPART_DUPLICATE_PART_HEADER}' "$MDIR/modsecurity.conf"; then
+  sed -i 's/DA %{MULTIPART_DATA_AFTER},[[:blank:]]*\\$/DA %{MULTIPART_DATA_AFTER}, DH %{MULTIPART_DUPLICATE_PART_HEADER}, \\/' "$MDIR/modsecurity.conf"
+fi
+STRICT_RULE=$(awk '/^[[:space:]]*SecRule[[:space:]]+MULTIPART_STRICT_ERROR[[:space:]]/{copy=1} copy {print; if ($0 !~ /\\$/) exit}' "$MDIR/modsecurity.conf")
+if ! grep -qE "$STRICT_ID_PATTERN" <<< "$STRICT_RULE" || ! grep -qw deny <<< "$STRICT_RULE"; then
+  err 'Strict multipart rule 200003 must remain active with a deny action.'; exit 1
 fi
 
 # Nginx's prefix is not the ModSecurity configuration directory.
 sed -i -E "s|^([[:blank:]]*SecUnicodeMapFile[[:blank:]]+)unicode.mapping([[:blank:]]+)|\1${MDIR}/unicode.mapping\2|" "$MDIR/modsecurity.conf"
 
-sed -i -E 's/^\s*SecRuleEngine\s+DetectionOnly/SecRuleEngine On/i' "$MDIR/modsecurity.conf" || true
+sed -i -E 's/^\s*SecRuleEngine\s+DetectionOnly/SecRuleEngine On/i' "$MDIR/modsecurity.conf"
 grep -qE '^\s*SecRuleEngine\s+' "$MDIR/modsecurity.conf" || echo "SecRuleEngine On" >> "$MDIR/modsecurity.conf"
+if grep -qiE '^[[:space:]]*SecRuleEngine[[:space:]]+Off\b' "$MDIR/modsecurity.conf" || \
+   ! grep -qiE '^[[:space:]]*SecRequestBodyAccess[[:space:]]+On\b' "$MDIR/modsecurity.conf"; then
+  err 'Existing settings disable WAF/body inspection; administrator review is required.'; exit 1
+fi
 
 MAIN="$MDIR/main.conf"
+backup_nginx_file "$MAIN"
 if [[ ! -f "$MAIN" ]]; then
   { echo "# WAFCONTROL main config"; echo "Include $MDIR/modsecurity.conf"; } > "$MAIN"
 fi
-state_append_array CREATED_FILES "$MAIN"
-state_append_array CREATED_FILES "$MDIR/modsecurity.conf"
-state_append_array CREATED_FILES "$MDIR/unicode.mapping"
 
 # Parse the base configuration with the actual connector before enabling it in
 # nginx.conf, so an incompatible template fails before changing the load setup.
@@ -250,7 +349,8 @@ validate_modsecurity_conf() {
   local staging result=0
   staging="$(mktemp -d -t wafcontrol-nginx-check-XXXXXX)" || return 1
   cat > "$staging/nginx.conf" <<CONF
-load_module ${MOD_DIR}/ngx_http_modsecurity_module.so;
+load_module ${NGX_MODULE};
+user ${NGX_USER};
 pid ${staging}/nginx.pid;
 error_log stderr;
 events {}
@@ -269,16 +369,19 @@ if ! validate_modsecurity_conf; then
   exit 1
 fi
 
-if ! grep -q 'ngx_http_modsecurity_module.so' "$NGX_MAIN" 2>/dev/null; then
-  cp -a "$NGX_MAIN" "${NGX_MAIN}.bak.${TS}"
-  state_put_map BACKUPS "$NGX_MAIN" "${NGX_MAIN}.bak.${TS}"
-  sed -i "1iload_module ${MOD_DIR}/ngx_http_modsecurity_module.so;" "$NGX_MAIN"
-  say "Injected load_module into nginx.conf"
-fi
+# Replace old connector loads, including packaged modules-enabled includes, and
+# load exactly one versioned module. Other dynamic modules are untouched.
+MODSEC_LOAD_PATTERN="^[[:space:]]*load_module[[:space:]]+[^;]*ngx_http_modsecurity_module\.so[\"']?[[:space:]]*;"
+while IFS= read -r -d '' config; do
+  backup_nginx_file "$config"
+  sed -i -E "\\|$MODSEC_LOAD_PATTERN|d" "$config"
+done < <(grep -RIlZ --include='*.conf' -E "$MODSEC_LOAD_PATTERN" /etc/nginx || true)
+backup_nginx_file "$NGX_MAIN"
+sed -i "1iload_module ${NGX_MODULE};" "$NGX_MAIN"
+say "Configured one load_module in nginx.conf"
 
 if ! grep -q 'WAFCONTROL-BEGIN' "$HTTP_FILE"; then
-  cp -a "$HTTP_FILE" "${HTTP_FILE}.bak.${TS}"
-  state_put_map BACKUPS "$HTTP_FILE" "${HTTP_FILE}.bak.${TS}"
+  backup_nginx_file "$HTTP_FILE"
   awk '
   BEGIN{done=0; seen_http=0}
   {
@@ -308,6 +411,10 @@ else
   warn "WAF block already present in $HTTP_FILE; skipping insert."
 fi
 
+CRS_DIR=$(sed -n 's|^[[:space:]]*Include[[:space:]]*\(.*\)/crs-setup\.conf[[:space:]]*$|\1|p' "$MAIN" | head -n1)
+if [[ -n "$CRS_DIR" && -d "$CRS_DIR/rules" ]]; then
+  say "Preserving existing CRS: $CRS_DIR"
+else
 say "Fetching latest CRS..."
 TAG="$(curl -s https://api.github.com/repos/coreruleset/coreruleset/releases/latest | jq -r '.tag_name' || true)"
 CRS_DIR=""
@@ -317,7 +424,7 @@ if [[ -n "$TAG" && "$TAG" != "null" ]]; then
   if [[ ! -d "$CRS_DIR" ]]; then
     TMPD="$(mktemp -d -t crs-XXXXXX)"
     wget -q "https://github.com/coreruleset/coreruleset/archive/refs/tags/${TAG}.tar.gz" -O "$TMPD/crs.tgz"
-    tar -xzf "$TMPD/crs.tgz" -C "$TMPD"
+    tar --no-same-owner -xzf "$TMPD/crs.tgz" -C "$TMPD"
     mv "$TMPD/coreruleset-${NUM}" "$CRS_DIR"
     rm -rf "$TMPD"
     say "CRS downloaded: ${TAG}"
@@ -333,13 +440,18 @@ else
     err "Failed to resolve latest CRS and no packaged CRS found."
   fi
 fi
+fi
 [[ -d "$CRS_DIR" ]] || { err "CRS directory missing: $CRS_DIR"; exit 1; }
-[[ -f "$CRS_DIR/crs-setup.conf" ]] || { [[ -f "$CRS_DIR/crs-setup.conf.example" ]] && cp "$CRS_DIR/crs-setup.conf.example" "$CRS_DIR/crs-setup.conf"; }
+[[ -f "$CRS_DIR/crs-setup.conf" ]] || { backup_nginx_file "$CRS_DIR/crs-setup.conf"; [[ -f "$CRS_DIR/crs-setup.conf.example" ]] && cp "$CRS_DIR/crs-setup.conf.example" "$CRS_DIR/crs-setup.conf"; }
 for f in REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf; do
-  [[ -f "$CRS_DIR/rules/$f" ]] || { [[ -f "$CRS_DIR/rules/${f}.example" ]] && cp "$CRS_DIR/rules/$f.example" "$CRS_DIR/rules/${f}" || true; }
+  if [[ ! -f "$CRS_DIR/rules/$f" && -f "$CRS_DIR/rules/${f}.example" ]]; then
+    backup_nginx_file "$CRS_DIR/rules/$f"
+    cp "$CRS_DIR/rules/$f.example" "$CRS_DIR/rules/$f"
+  fi
 done
 EXCL="$CRS_DIR/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"
 if ! grep -q '/crs/rules/save/' "$EXCL" 2>/dev/null; then
+  backup_nginx_file "$EXCL"
   cat >> "$EXCL" <<'EOR'
 SecRule REQUEST_URI "@beginsWith /crs/rules/save/"        "id:1500010,phase:1,nolog,pass,ctl:ruleEngine=Off"
 SecRule REQUEST_URI "@beginsWith /dashboard/crs/settings/" "id:1500011,phase:1,nolog,pass,ctl:ruleEngine=Off"
@@ -358,6 +470,7 @@ VHOST="/etc/nginx/conf.d/wafcontrol.conf"
 AUTH_SNIPPET=""
 if [[ "${BASIC_AUTH_ENABLE}" = "1" && -n "${BASIC_AUTH_USER}" && -n "${BASIC_AUTH_PASS}" ]]; then
   HTPASS="/etc/nginx/.htpasswdwaf"
+  backup_nginx_file "$HTPASS"
   HASH="$(openssl passwd -apr1 "${BASIC_AUTH_PASS}")"
   printf '%s:%s\n' "${BASIC_AUTH_USER}" "${HASH}" > "${HTPASS}"
   chown root:"$NGX_GROUP" "${HTPASS}" || true
@@ -365,7 +478,10 @@ if [[ "${BASIC_AUTH_ENABLE}" = "1" && -n "${BASIC_AUTH_USER}" && -n "${BASIC_AUT
   AUTH_SNIPPET=$'    auth_basic "Restricted WAF Dashboard";\n    auth_basic_user_file /etc/nginx/.htpasswdwaf;'
 fi
 
-if [[ "$MODE" == "domain" ]]; then
+if [[ -f "$VHOST" ]]; then
+  say "Preserving existing app vhost: $VHOST"
+elif [[ "$MODE" == "domain" ]]; then
+  backup_nginx_file "$VHOST"
   cat > "$VHOST" <<NGX
 server {
     listen 80;
@@ -391,16 +507,10 @@ ${AUTH_SNIPPET}
     }
 }
 NGX
-  state_append_array CREATED_FILES "$VHOST"
   say "App vhost written: $VHOST (port 80)"
 
-  if [[ "$SSL_ENABLE" -eq 1 ]]; then
-    say "Installing certbot and enabling SSL for ${DOMAIN}"
-    apt install -y certbot python3-certbot-nginx
-    EMAIL="${CERTBOT_EMAIL:-admin@${DOMAIN}}"
-    certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --redirect || warn "Certbot failed"
-  fi
 else
+  backup_nginx_file "$VHOST"
   cat > "$VHOST" <<NGX
 server {
     listen ${HTTP_PORT};
@@ -426,14 +536,33 @@ ${AUTH_SNIPPET}
     }
 }
 NGX
-  state_append_array CREATED_FILES "$VHOST"
   say "App vhost written: $VHOST (port ${HTTP_PORT})"
 fi
 
 if nginx -t; then
-  systemctl restart nginx
-  say "Nginx WAF ready (ModSecurity v3 + CRS)."
+  ACTIVATION_ATTEMPTED=1
+  if systemctl is-active --quiet nginx; then
+    PID=$(systemctl show nginx -p MainPID --value)
+    # A reload retains an already loaded library with the same SONAME.
+    LOADED_LIBRARY=$(awk '$6 ~ /\/libmodsecurity\.so/ {print $6; exit}' "/proc/$PID/maps")
+    if [[ "$LOADED_LIBRARY" != "$MODSEC_LIBRARY" ]]; then systemctl restart nginx
+    else systemctl reload nginx; fi
+  else systemctl start nginx; fi
+  systemctl is-active --quiet nginx
+  PID=$(systemctl show nginx -p MainPID --value)
+  awk -v library="$MODSEC_LIBRARY" '$6==library {found=1} END {exit !found}' "/proc/$PID/maps" || {
+    err "Nginx has not loaded the verified library: $MODSEC_LIBRARY"; exit 1;
+  }
+  DEPLOYED=1
+  say "Nginx WAF ready (verified ModSecurity v$MODSEC_VERSION + CRS)."
 else
-  err "nginx -t failed. Check the configuration."
+  err "nginx -t failed; restoring the previous configuration."
   exit 1
+fi
+
+if [[ "$MODE" == domain && "$SSL_ENABLE" -eq 1 ]]; then
+  say "Installing certbot and enabling SSL for ${DOMAIN}"
+  apt install -y certbot python3-certbot-nginx
+  EMAIL="${CERTBOT_EMAIL:-admin@${DOMAIN}}"
+  certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --redirect || warn "Certbot failed"
 fi
